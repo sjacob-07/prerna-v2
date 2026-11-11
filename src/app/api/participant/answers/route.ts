@@ -122,6 +122,21 @@ function validatePatch(
     );
   }
 
+  // Exact option validation for Experience 02.
+  if (experience === 2) {
+    const options: Record<string, string[]> = {
+      scene1: ["WAKE", "SLEEP"],
+      scene2: ["LEAVE", "DELAY"],
+      scene3: ["ENTER", "RETURN"],
+      commitment: ["ATTEND", "ENCOURAGE", "PARTICIPATE"],
+    };
+
+    return keys.every((key) => {
+      const value = patch[key];
+      return typeof value === "string" && options[key]?.includes(value);
+    });
+  }
+
   // Exact option validation for Experience 03.
   if (experience === 3) {
     const options: Record<string, string[]> = {
@@ -175,8 +190,7 @@ function validatePatch(
     });
   }
 
-  // Experience 02 and 05: enforce allowed fields and bounded strings.
-  // We can add exact option allowlists after checking their component code.
+  // Experience 05: free-text private reflection, bounded strings.
   return keys.every(
     (key) =>
       typeof patch[key] === "string" &&

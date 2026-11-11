@@ -12,6 +12,29 @@ const UUID_REGEX =
 
 const noStore = { "Cache-Control": "no-store" };
 
+// Allowed choices per scene for the facilitator-led reveals of
+// Experiences 02–04. Only these values are counted.
+const SCENE_OPTIONS: Record<"2" | "3" | "4", Record<string, string[]>> = {
+  "2": {
+    scene1: ["WAKE", "SLEEP"],
+    scene2: ["LEAVE", "DELAY"],
+    scene3: ["ENTER", "RETURN"],
+  },
+  "3": {
+    scene1: ["higher_salary", "sunday_off", "discuss"],
+    scene2: ["accept", "explain", "hope"],
+    scene3: ["continue", "reconsider", "talk"],
+  },
+  "4": {
+    scene1: ["pray_first", "check_messages", "watch_reels", "forget_prayer"],
+    scene2: ["bring_to_god", "solve_alone", "pray_and_support", "keep_worrying"],
+    scene3: ["restart", "wait_feeling", "make_plan", "leave_for_later"],
+  },
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
 function jsonError(message: string, status: number) {
   return NextResponse.json(
     { success: false, error: message },
@@ -38,16 +61,22 @@ if (!validateSameOrigin(request, false)) {
     const experience = request.nextUrl.searchParams.get("experience");
     const round = request.nextUrl.searchParams.get("round");
 
+    const isSceneExperience =
+      experience === "2" || experience === "3" || experience === "4";
+
     if (
       !sessionId ||
       !UUID_REGEX.test(sessionId) ||
-      experience !== "1" ||
-      (round !== "1" && round !== "2")
+      !(
+        (experience === "1" && (round === "1" || round === "2")) ||
+        (isSceneExperience &&
+          (round === "1" || round === "2" || round === "3"))
+      )
     ) {
       return jsonError("Invalid session or results request.", 400);
     }
 
-    const expectedStage = round === "1" ? "REVEAL_1" : "REVEAL_2";
+    const expectedStage = `REVEAL_${round}`;
 
     const { data: session, error: sessionError } = await supabaseAdmin
       .from("experiment_sessions")
@@ -56,14 +85,14 @@ if (!validateSameOrigin(request, false)) {
       .maybeSingle();
 
     if (sessionError) {
-      console.error("Experience 01 results session lookup failed:", sessionError);
+      console.error("Results session lookup failed:", sessionError);
       return jsonError("Could not load room results.", 500);
     }
 
     if (!session) return jsonError("Session not found.", 404);
 
     if (
-      session.current_experiment !== 1 ||
+      session.current_experiment !== Number(experience) ||
       session.current_stage !== expectedStage
     ) {
       return jsonError("Results are not currently available.", 403);
@@ -79,7 +108,7 @@ if (!validateSameOrigin(request, false)) {
 
     if (membershipError) {
       console.error(
-        "Experience 01 results membership check failed:",
+        "Results membership check failed:",
         membershipError
       );
       return jsonError("Could not verify session membership.", 500);
@@ -98,8 +127,47 @@ if (!validateSameOrigin(request, false)) {
       .eq("session_id", sessionId);
 
     if (resultsError) {
-      console.error("Experience 01 aggregate query failed:", resultsError);
+      console.error("Results aggregate query failed:", resultsError);
       return jsonError("Could not load room results.", 500);
+    }
+
+    // Experiences 02–04: anonymous per-scene counts for every scene
+    // revealed so far (scene1..scene{round}). No individual answers leave.
+    if (isSceneExperience) {
+      const options = SCENE_OPTIONS[experience];
+      const experimentKey = `experiment${experience}`;
+      const revealedScenes = ["scene1", "scene2", "scene3"].slice(
+        0,
+        Number(round)
+      );
+
+      const sceneCounts: Record<string, Record<string, number>> = {};
+      for (const scene of revealedScenes) {
+        sceneCounts[scene] = Object.fromEntries(
+          options[scene].map((option) => [option, 0])
+        );
+      }
+
+      for (const row of rows ?? []) {
+        if (!isRecord(row.answer)) continue;
+        const response = row.answer[experimentKey];
+        if (!isRecord(response)) continue;
+
+        for (const scene of revealedScenes) {
+          const choice = response[scene];
+          if (
+            typeof choice === "string" &&
+            options[scene].includes(choice)
+          ) {
+            sceneCounts[scene][choice] += 1;
+          }
+        }
+      }
+
+      return NextResponse.json(
+        { success: true, counts: sceneCounts },
+        { headers: noStore }
+      );
     }
 
     const counts = { A: 0, B: 0, C: 0, D: 0 };
@@ -142,7 +210,7 @@ if (!validateSameOrigin(request, false)) {
       { headers: noStore }
     );
   } catch (error) {
-    console.error("Experience 01 results API error:", error);
+    console.error("Results API error:", error);
     return jsonError("Internal server error.", 500);
   }
 }

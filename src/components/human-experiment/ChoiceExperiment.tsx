@@ -31,7 +31,11 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import type { HumanExperimentSession } from "@/lib/human-experiment/session";
-import { supabase } from "@/lib/supabase";
+import {
+  loadParticipantAnswer,
+  loadRoomResults,
+  saveParticipantAnswer,
+} from "@/lib/human-experiment/answerSaveClient";
 
 type Language = "en" | "hi";
 type QuestionKey = "scene1" | "scene2" | "scene3";
@@ -300,10 +304,6 @@ keyQuestion:
   },
 } as const;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function IconChoice({
   icon: Icon,
   title,
@@ -478,7 +478,6 @@ export default function CommitmentExperiment({
   session: HumanExperimentSession;
 }) {
   const [language, setLanguage] = useState<Language>("en");
-  const [participantKey, setParticipantKey] = useState("");
   const [answers, setAnswers] = useState<SceneAnswers>(EMPTY_ANSWERS);
   const [answersLoading, setAnswersLoading] = useState(true);
   const [sceneOneSaved, setSceneOneSaved] = useState(false);
@@ -494,62 +493,50 @@ export default function CommitmentExperiment({
 }, [stage]);
   const isLocked = session.status === "PAUSED";
 
-  // Read the participant identity used by the other experiences.
-  useEffect(() => {
-    const key = window.localStorage.getItem("arise-human-experiment-participant");
-    if (key) setParticipantKey(key);
-    else setAnswersLoading(false);
-  }, []);
-
   // Restore this participant's choices if the page is refreshed.
+  // Identity comes from the secure participant cookie on the server.
   useEffect(() => {
-    if (!participantKey || !session.sessionId || !supabase) return;
+    if (!session.sessionId) {
+      setAnswersLoading(false);
+      return;
+    }
+    const sessionId = session.sessionId;
     let cancelled = false;
 
     async function loadAnswers() {
       setAnswersLoading(true);
-      const { data, error: readError } = await supabase!
-        .from("experiment_participants")
-        .select("answer")
-        .eq("session_id", session.sessionId)
-        .eq("participant_key", participantKey)
-        .maybeSingle();
-
-      if (cancelled) return;
-      if (readError) {
-        console.error("CHURCH ATTENDANCE ANSWER LOAD FAILED:", readError);
-        setAnswersLoading(false);
-        return;
+      try {
+        const { answer: saved } = await loadParticipantAnswer(sessionId, 2);
+        if (cancelled) return;
+        setAnswers({
+          scene1: typeof saved.scene1 === "string" ? saved.scene1 : null,
+          scene2: typeof saved.scene2 === "string" ? saved.scene2 : null,
+          scene3: typeof saved.scene3 === "string" ? saved.scene3 : null,
+          commitment: typeof saved.commitment === "string" ? saved.commitment : null,
+        });
+        setSceneOneSaved(typeof saved.scene1 === "string");
+      } catch (err) {
+        console.error("CHURCH ATTENDANCE ANSWER LOAD FAILED:", err);
+      } finally {
+        if (!cancelled) setAnswersLoading(false);
       }
-
-      const saved = isRecord(data?.answer) && isRecord(data.answer.experiment2)
-        ? data.answer.experiment2
-        : {};
-      setAnswers({
-        scene1: typeof saved.scene1 === "string" ? saved.scene1 : null,
-        scene2: typeof saved.scene2 === "string" ? saved.scene2 : null,
-        scene3: typeof saved.scene3 === "string" ? saved.scene3 : null,
-        commitment: typeof saved.commitment === "string" ? saved.commitment : null,
-      });
-      setSceneOneSaved(typeof saved.scene1 === "string");
-      setAnswersLoading(false);
     }
 
     void loadAnswers();
     return () => {
       cancelled = true;
     };
-  }, [participantKey, session.sessionId]);
+  }, [session.sessionId]);
 
   // Reset only the local sub-navigation when the facilitator opens a new phase.
   useEffect(() => {
     if (stage === "DISCUSSION") setError("");
   }, [stage]);
 
-  // Save into the existing answer JSON. Other experiments' answers are preserved.
+  // Save through the authenticated API. The server merges the patch into
+  // this participant's answer and preserves other experiences' answers.
   async function saveAnswerPatch(patch: Partial<SceneAnswers>, markComplete = false) {
-    const client = supabase;
-    if (!client || !participantKey || !session.sessionId) {
+    if (!session.sessionId) {
       setError(t.connectionError);
       return false;
     }
@@ -560,88 +547,22 @@ export default function CommitmentExperiment({
     setError("");
 
     try {
-      const { data: existing, error: readError } = await client
-        .from("experiment_participants")
-        .select("answer")
-        .eq("session_id", session.sessionId)
-        .eq("participant_key", participantKey)
-        .maybeSingle();
+      const result = await saveParticipantAnswer({
+        sessionId: session.sessionId,
+        experience: 2,
+        patch,
+        markComplete,
+        fallbackMessage: t.saveError,
+      });
 
-      if (readError) throw readError;
-      if (!existing) throw new Error("Participant profile was not found for this session.");
-
-      const previousAnswer = isRecord(existing.answer) ? existing.answer : {};
-      const previousExperiment = isRecord(previousAnswer.experiment2)
-        ? previousAnswer.experiment2
-        : {};
-      const nextExperiment = { ...previousExperiment, ...patch };
-      const nextAnswer = { ...previousAnswer, experiment2: nextExperiment };
-
-      const { error: updateError } = await client
-        .from("experiment_participants")
-        .update({
-          answer: nextAnswer,
-          connected: true,
-          current_experiment: 2,
-          ...(markComplete
-            ? { status: "ANSWERED" as const, submitted_at: new Date().toISOString() }
-            : {}),
-        })
-        .eq("session_id", session.sessionId)
-        .eq("participant_key", participantKey);
-
-      if (updateError) throw updateError;
+      if (!result.ok) {
+        console.error("CHURCH ATTENDANCE ANSWER SAVE FAILED:", result.message);
+        setError(t.saveError);
+        return false;
+      }
 
       setAnswers((previous) => ({ ...previous, ...patch }));
       return true;
-        } catch (err) {
-      console.error("CHURCH ATTENDANCE ANSWER SAVE FAILED:", err);
-
-      // The write may have reached the database even if its response failed.
-      // Verify the stored answer before showing a failure message.
-      try {
-        const {
-          data: verified,
-          error: verificationError,
-        } = await client
-          .from("experiment_participants")
-          .select("answer, status")
-          .eq("session_id", session.sessionId)
-          .eq("participant_key", participantKey)
-          .maybeSingle();
-
-        if (verificationError) {
-          console.error("ANSWER SAVE VERIFICATION FAILED:", verificationError);
-        }
-
-        if (!verificationError && verified) {
-          const storedAnswer = isRecord(verified.answer)
-            ? verified.answer
-            : {};
-
-          const storedExperiment = isRecord(storedAnswer.experiment2)
-            ? storedAnswer.experiment2
-            : {};
-
-          const patchIsSaved = (
-            Object.keys(patch) as (keyof SceneAnswers)[]
-          ).every((key) => storedExperiment[key] === patch[key]);
-
-          const completionIsSaved =
-            !markComplete || verified.status === "ANSWERED";
-
-          if (patchIsSaved && completionIsSaved) {
-            setAnswers((previous) => ({ ...previous, ...patch }));
-            setError("");
-            return true;
-          }
-        }
-      } catch (verificationError) {
-        console.error("ANSWER SAVE VERIFICATION ERROR:", verificationError);
-      }
-
-      setError(t.saveError);
-      return false;
     } finally {
       setSaving(false);
     }
@@ -688,44 +609,27 @@ export default function CommitmentExperiment({
     if (saved) setError("");
   }
 
-  // Aggregate anonymous choices for the facilitator-led reveal.
+  // Anonymous room counts for the facilitator-led reveal, aggregated on the server.
   useEffect(() => {
-    if (!["REVEAL_1", "REVEAL_2", "REVEAL_3"].includes(stage) || !session.sessionId || !supabase) return;
+    const revealRounds: Record<string, number> = { REVEAL_1: 1, REVEAL_2: 2, REVEAL_3: 3 };
+    const round = revealRounds[stage];
+    if (!round || !session.sessionId) return;
+    const sessionId = session.sessionId;
     let cancelled = false;
 
-    async function loadRoomResults() {
+    async function loadResults() {
       setResultsLoading(true);
-      const { data, error: readError } = await supabase!
-        .from("experiment_participants")
-        .select("answer")
-        .eq("session_id", session.sessionId);
-
-      if (cancelled) return;
-      if (readError) {
-        console.error("CHURCH ATTENDANCE RESULTS LOAD FAILED:", readError);
-        setResultsLoading(false);
-        return;
+      try {
+        const counts = await loadRoomResults(sessionId, 2, round);
+        if (!cancelled) setRoomResults(counts as RoomResults);
+      } catch (err) {
+        console.error("CHURCH ATTENDANCE RESULTS LOAD FAILED:", err);
+      } finally {
+        if (!cancelled) setResultsLoading(false);
       }
-
-      const counts: RoomResults = {
-        scene1: { WAKE: 0, SLEEP: 0 },
-        scene2: { LEAVE: 0, DELAY: 0 },
-        scene3: { ENTER: 0, RETURN: 0 },
-      };
-
-      (data ?? []).forEach((row: { answer: unknown }) => {
-        if (!isRecord(row.answer) || !isRecord(row.answer.experiment2)) return;
-        const response = row.answer.experiment2;
-        if (typeof response.scene1 === "string" && response.scene1 in counts.scene1) counts.scene1[response.scene1] += 1;
-        if (typeof response.scene2 === "string" && response.scene2 in counts.scene2) counts.scene2[response.scene2] += 1;
-        if (typeof response.scene3 === "string" && response.scene3 in counts.scene3) counts.scene3[response.scene3] += 1;
-      });
-
-      setRoomResults(counts);
-      setResultsLoading(false);
     }
 
-    void loadRoomResults();
+    void loadResults();
     return () => {
       cancelled = true;
     };

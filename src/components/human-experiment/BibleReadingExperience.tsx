@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import Image from "next/image";
 import type { HumanExperimentSession } from "@/lib/human-experiment/session";
+import { saveParticipantAnswer } from "@/lib/human-experiment/answerSaveClient";
 
 type Language = "en" | "hi";
 type Round = 1 | 2;
@@ -301,27 +302,20 @@ useEffect(() => {
     setError("");
 
     try {
-      const response = await fetch("/api/participant/answers", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId: session.sessionId,
-          experience: 1,
-          patch: round === 1
-            ? { round1: currentAnswer }
-            : { round2: currentAnswer },
-          markComplete: true,
-        }),
+      const result = await saveParticipantAnswer({
+        sessionId: session.sessionId,
+        experience: 1,
+        patch: round === 1
+          ? { round1: currentAnswer }
+          : { round2: currentAnswer },
+        markComplete: true,
+        fallbackMessage: t.saveError,
       });
 
-      const result = await response.json();
-      if (!response.ok || !result.success) {
-        throw new Error(result.error || "Answer save failed.");
+      if (!result.ok) {
+        console.error("EXPERIENCE 01 ANSWER SAVE FAILED:", result.message);
+        setError(result.message);
       }
-    } catch (err) {
-      console.error("EXPERIENCE 01 ANSWER SAVE FAILED:", err);
-      setError(err instanceof Error ? err.message : t.saveError);
     } finally {
       setSaving(false);
     }

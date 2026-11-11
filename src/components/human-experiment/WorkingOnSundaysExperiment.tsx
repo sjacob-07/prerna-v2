@@ -20,7 +20,11 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import type { HumanExperimentSession } from "@/lib/human-experiment/session";
-import { supabase } from "@/lib/supabase";
+import {
+  loadParticipantAnswer,
+  loadRoomResults,
+  saveParticipantAnswer,
+} from "@/lib/human-experiment/answerSaveClient";
 
 type Language = "en" | "hi";
 type SceneKey = "scene1" | "scene2" | "scene3";
@@ -266,9 +270,6 @@ const TEXT = {
   },
 };
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-
 const LABELS: Record<SceneKey, string[]> = {
   scene1: [...OPTIONS.scene1],
   scene2: [...OPTIONS.scene2],
@@ -281,7 +282,6 @@ export default function WorkingOnSundaysExperiment({
   session: HumanExperimentSession;
 }) {
   const [language, setLanguage] = useState<Language>("en");
-  const [participantKey, setParticipantKey] = useState("");
   const [answers, setAnswers] = useState<Answers>(EMPTY);
   const [commitment, setCommitment] = useState("");
   const [saving, setSaving] = useState(false);
@@ -294,52 +294,41 @@ export default function WorkingOnSundaysExperiment({
   const stage = String(session.stage ?? "INTRO");
   const locked = session.status === "PAUSED";
 
+  // Restore this participant's own answers. Identity comes from the
+  // secure participant cookie on the server, not from localStorage.
   useEffect(() => {
-    const key = window.localStorage.getItem("arise-human-experiment-participant");
-    if (key) setParticipantKey(key);
-    else setLoading(false);
-  }, []);
-
-  useEffect(() => {
-    if (!participantKey || !session.sessionId || !supabase) return;
+    if (!session.sessionId) {
+      setLoading(false);
+      return;
+    }
+    const sessionId = session.sessionId;
     let cancelled = false;
 
     async function loadAnswers() {
       setLoading(true);
-      const { data, error: readError } = await supabase!
-        .from("experiment_participants")
-        .select("answer")
-        .eq("session_id", session.sessionId)
-        .eq("participant_key", participantKey)
-        .maybeSingle();
-
-      if (cancelled) return;
-      if (readError) {
-        console.error("SUNDAY CHOICE LOAD FAILED:", readError);
-        setLoading(false);
-        return;
+      try {
+        const { answer: saved } = await loadParticipantAnswer(sessionId, 3);
+        if (cancelled) return;
+        setAnswers({
+          scene1: typeof saved.scene1 === "string" ? saved.scene1 : null,
+          scene2: typeof saved.scene2 === "string" ? saved.scene2 : null,
+          scene3: typeof saved.scene3 === "string" ? saved.scene3 : null,
+          commitment: typeof saved.commitment === "string" ? saved.commitment : null,
+        });
+        setCommitment(typeof saved.commitment === "string" ? saved.commitment : "");
+      } catch (err) {
+        console.error("SUNDAY CHOICE LOAD FAILED:", err);
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-
-      const saved = isRecord(data?.answer) && isRecord(data.answer.experiment3)
-        ? data.answer.experiment3
-        : {};
-
-      setAnswers({
-        scene1: typeof saved.scene1 === "string" ? saved.scene1 : null,
-        scene2: typeof saved.scene2 === "string" ? saved.scene2 : null,
-        scene3: typeof saved.scene3 === "string" ? saved.scene3 : null,
-        commitment: typeof saved.commitment === "string" ? saved.commitment : null,
-      });
-      setCommitment(typeof saved.commitment === "string" ? saved.commitment : "");
-      setLoading(false);
     }
 
     void loadAnswers();
     return () => { cancelled = true; };
-  }, [participantKey, session.sessionId]);
+  }, [session.sessionId]);
 
   async function savePatch(patch: Partial<Answers>, markComplete = false) {
-    if (!supabase || !participantKey || !session.sessionId) {
+    if (!session.sessionId) {
       setError(t.connectionError);
       return false;
     }
@@ -348,43 +337,20 @@ export default function WorkingOnSundaysExperiment({
     setSaving(true);
     setError("");
     try {
-      const { data: existing, error: readError } = await supabase
-        .from("experiment_participants")
-        .select("answer")
-        .eq("session_id", session.sessionId)
-        .eq("participant_key", participantKey)
-        .maybeSingle();
-
-      if (readError) throw readError;
-      if (!existing) throw new Error("Participant not found.");
-
-      const previous = isRecord(existing.answer) ? existing.answer : {};
-      const previousExperiment = isRecord(previous.experiment3) ? previous.experiment3 : {};
-      const nextAnswer = {
-        ...previous,
-        experiment3: { ...previousExperiment, ...patch },
-      };
-
-      const { error: updateError } = await supabase
-        .from("experiment_participants")
-        .update({
-          answer: nextAnswer,
-          connected: true,
-          current_experiment: 3,
-          ...(markComplete
-            ? { status: "ANSWERED" as const, submitted_at: new Date().toISOString() }
-            : {}),
-        })
-        .eq("session_id", session.sessionId)
-        .eq("participant_key", participantKey);
-
-      if (updateError) throw updateError;
+      const result = await saveParticipantAnswer({
+        sessionId: session.sessionId,
+        experience: 3,
+        patch,
+        markComplete,
+        fallbackMessage: t.error,
+      });
+      if (!result.ok) {
+        console.error("SUNDAY CHOICE SAVE FAILED:", result.message);
+        setError(t.error);
+        return false;
+      }
       setAnswers((current) => ({ ...current, ...patch }));
       return true;
-    } catch (err) {
-      console.error("SUNDAY CHOICE SAVE FAILED:", err);
-      setError(t.error);
-      return false;
     } finally {
       setSaving(false);
     }
@@ -406,46 +372,24 @@ export default function WorkingOnSundaysExperiment({
     await savePatch({ commitment: commitment.trim() }, true);
   }
 
+  // Anonymous room counts for the reveal, aggregated on the server.
   useEffect(() => {
-    const revealStages: Record<string, SceneKey> = {
-      REVEAL_1: "scene1",
-      REVEAL_2: "scene2",
-      REVEAL_3: "scene3",
-    };
-    const revealedScene = revealStages[stage];
-    if (!revealedScene || !session.sessionId || !supabase) return;
-
+    const revealRounds: Record<string, number> = { REVEAL_1: 1, REVEAL_2: 2, REVEAL_3: 3 };
+    const round = revealRounds[stage];
+    if (!round || !session.sessionId) return;
+    const sessionId = session.sessionId;
     let cancelled = false;
+
     async function loadResults() {
       setResultsLoading(true);
-      const { data, error: resultError } = await supabase!
-        .from("experiment_participants")
-        .select("answer")
-        .eq("session_id", session.sessionId);
-
-      if (cancelled) return;
-      if (resultError) {
-        console.error("SUNDAY CHOICE RESULTS FAILED:", resultError);
-        setResultsLoading(false);
-        return;
+      try {
+        const counts = await loadRoomResults(sessionId, 3, round);
+        if (!cancelled) setResults(counts as Counts);
+      } catch (err) {
+        console.error("SUNDAY CHOICE RESULTS FAILED:", err);
+      } finally {
+        if (!cancelled) setResultsLoading(false);
       }
-
-      const counts: Counts = {
-        scene1: { higher_salary: 0, sunday_off: 0, discuss: 0 },
-        scene2: { accept: 0, explain: 0, hope: 0 },
-        scene3: { continue: 0, reconsider: 0, talk: 0 },
-      };
-
-      (data ?? []).forEach((row: { answer: unknown }) => {
-        if (!isRecord(row.answer) || !isRecord(row.answer.experiment3)) return;
-        const response = row.answer.experiment3[revealedScene];
-        if (typeof response === "string" && response in counts[revealedScene]) {
-          counts[revealedScene][response] += 1;
-        }
-      });
-
-      setResults(counts);
-      setResultsLoading(false);
     }
 
     void loadResults();

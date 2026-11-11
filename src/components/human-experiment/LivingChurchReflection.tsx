@@ -7,7 +7,10 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import type { HumanExperimentSession } from "@/lib/human-experiment/session";
-import { supabase } from "@/lib/supabase";
+import {
+  loadParticipantAnswer,
+  saveParticipantAnswer,
+} from "@/lib/human-experiment/answerSaveClient";
 
 type Language = "en" | "hi";
 type Reflection = { restore: string; strengthen: string; nextStep: string; commitment: string };
@@ -138,7 +141,6 @@ export default function LivingChurchReflection({
   session: HumanExperimentSession;
 }) {
   const [language, setLanguage] = useState<Language>("en");
-  const [participantKey, setParticipantKey] = useState("");
   const [reflection, setReflection] = useState<Reflection>(EMPTY);
   const [journeyEntries, setJourneyEntries] = useState<CommitmentEntry[]>([]);
   const [downloadingCard, setDownloadingCard] = useState(false);
@@ -155,18 +157,19 @@ export default function LivingChurchReflection({
 
   useEffect(() => { window.scrollTo({ top: 0, left: 0, behavior: "auto" }); }, [stage]);
   useEffect(() => {
-    const key = window.localStorage.getItem("arise-human-experiment-participant");
-    if (key) setParticipantKey(key); else setLoading(false);
-  }, []);
-  useEffect(() => {
-    if (!participantKey || !session.sessionId || !supabase) return;
+    if (!session.sessionId) { setLoading(false); return; }
+    const sessionId = session.sessionId;
     let cancelled = false;
     async function loadPrivateReflection() {
       setLoading(true);
-      const { data, error: readError } = await supabase!.from("experiment_participants").select("answer").eq("session_id", session.sessionId).eq("participant_key", participantKey).maybeSingle();
+      // Identity comes from the secure participant cookie on the server.
+      // The API returns only this participant's reflection plus their own
+      // earlier commitments ("journey"), never other participants' data.
+      let loaded: Awaited<ReturnType<typeof loadParticipantAnswer>>;
+      try { loaded = await loadParticipantAnswer(sessionId, 5); }
+      catch (err) { console.error("EXPERIENCE 05 PRIVATE REFLECTION LOAD FAILED:", err); if (!cancelled) setLoading(false); return; }
       if (cancelled) return;
-      if (readError) { console.error("EXPERIENCE 05 PRIVATE REFLECTION LOAD FAILED:", readError); setLoading(false); return; }
-      const answer = isRecord(data?.answer) ? data.answer : {};
+      const answer: Record<string, unknown> = { ...loaded.journey, experiment5: { privateReflection: loaded.answer.privateReflection } };
       const saved = isRecord(answer.experiment5) && isRecord(answer.experiment5.privateReflection) ? answer.experiment5.privateReflection : {};
       setReflection({ restore: typeof saved.restore === "string" ? saved.restore : "", strengthen: typeof saved.strengthen === "string" ? saved.strengthen : "", nextStep: typeof saved.nextStep === "string" ? saved.nextStep : "", commitment: typeof saved.commitment === "string" ? saved.commitment : "" });
       setSaved(Boolean(saved.savedAt));
@@ -208,24 +211,18 @@ export default function LivingChurchReflection({
     }
     void loadPrivateReflection();
     return () => { cancelled = true; };
-  }, [participantKey, session.sessionId]);
+  }, [session.sessionId]);
 
   async function savePrivateReflection() {
-    if (!participantKey || !session.sessionId || !supabase) { setError(t.connectionError); return; }
+    if (!session.sessionId) { setError(t.connectionError); return; }
     if (locked || saving) return;
     if (![reflection.restore, reflection.strengthen, reflection.nextStep, reflection.commitment].some((value) => value.trim())) { setError(isHindi ? "कृपया कम-से-कम एक बात लिखें।" : "Please write at least one reflection before saving."); return; }
     setSaving(true); setError("");
     try {
-      const { data: existing, error: readError } = await supabase.from("experiment_participants").select("answer").eq("session_id", session.sessionId).eq("participant_key", participantKey).maybeSingle();
-      if (readError) throw readError;
-      if (!existing) throw new Error("Participant not found.");
-      const previous = isRecord(existing.answer) ? existing.answer : {};
-      const previousExperiment = isRecord(previous.experiment5) ? previous.experiment5 : {};
-      const nextAnswer = { ...previous, experiment5: { ...previousExperiment, privateReflection: { ...reflection, savedAt: new Date().toISOString() } } };
-      const { error: updateError } = await supabase.from("experiment_participants").update({ answer: nextAnswer, connected: true, current_experiment: 5 }).eq("session_id", session.sessionId).eq("participant_key", participantKey);
-      if (updateError) throw updateError;
-      setSaved(true);
-    } catch (err) { console.error("EXPERIENCE 05 PRIVATE REFLECTION SAVE FAILED:", err); setError(t.error); }
+      const result = await saveParticipantAnswer({ sessionId: session.sessionId, experience: 5, patch: { ...reflection }, fallbackMessage: t.error });
+      if (result.ok) setSaved(true);
+      else { console.error("EXPERIENCE 05 PRIVATE REFLECTION SAVE FAILED:", result.message); setError(t.error); }
+    }
     finally { setSaving(false); }
   }
 
